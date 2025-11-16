@@ -64,6 +64,44 @@ wss.on('connection', ws => {
                 }
                 break;
             }
+            
+            // ----------------------------------------------------
+            // الميزة الجديدة 1: طلب قائمة الأكواد النشطة من المشرف
+            // ----------------------------------------------------
+            case 'request-active-codes': {
+                const activeCodes = [];
+                // نبحث عن الجلسات التي تم فيها إقران (receiver !== null)
+                sessions.forEach((session, code) => {
+                    if (session.receiver) {
+                        activeCodes.push(code);
+                    }
+                });
+                // نرسل القائمة إلى المشرف الطالب
+                ws.send(JSON.stringify({ type: 'active-codes-list', codes: activeCodes }));
+                console.log(`Sent active codes list (${activeCodes.length})`);
+                break;
+            }
+
+            // ----------------------------------------------------
+            // الميزة الجديدة 2: توجيه أمر الفصل القسري إلى العميل
+            // ----------------------------------------------------
+            case 'admin-force-disconnect': {
+                const codeToClose = data.code;
+                const sessionToClose = sessions.get(codeToClose);
+                
+                if (sessionToClose && sessionToClose.receiver) {
+                    // نرسل أمر 'admin-disconnect' إلى العميل (المستقبل) لقطع الاتصال
+                    sessionToClose.receiver.send(JSON.stringify({ type: 'admin-disconnect' }));
+                    
+                    // إشعار المشرف بأن الأمر تم إرساله
+                    ws.send(JSON.stringify({ type: 'admin-action-success', message: `Disconnect command sent to ${codeToClose}` }));
+                    console.log(`Sent force disconnect command for ${codeToClose}`);
+                } else {
+                    ws.send(JSON.stringify({ type: 'session-error', message: `Code ${codeToClose} not active or invalid.` }));
+                }
+                break;
+            }
+            
         }
     });
 
