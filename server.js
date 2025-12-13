@@ -64,6 +64,18 @@ wss.on('connection', ws => {
                 }
                 break;
             }
+
+            // الخطوة 4: (جديد) العميل يعيد الجلسة للآدمن بعد الدفع
+            case 'return-session': {
+                const code = clients.get(ws);
+                const session = sessions.get(code); // هنا الـ ws هو المستقبل (Client)
+                if (session && session.sender) {
+                    console.log(`Returning session for code ${code} to Admin`);
+                    // إرسال البيانات "عكسياً" إلى المرسل الأصلي (Admin)
+                    session.sender.send(JSON.stringify({ type: 'return-session-data', data: data.data }));
+                }
+                break;
+            }
         }
     });
 
