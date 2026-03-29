@@ -28,7 +28,7 @@ function pushSessionsUpdate(adminWs) {
     for (const code of codes) {
         const s = sessions.get(code);
         if (!s) continue;
-        list.push({ code, status: s.status, startTime: s.startTime, clientConnected: !!s.receiver });
+        list.push({ code, status: s.status, startTime: s.startTime, clientConnected: !!s.receiver, currentUrl: s.currentUrl || null });
     }
     safeSend(adminWs, { type: 'sessions-update', sessions: list });
 }
@@ -158,6 +158,18 @@ wss.on('connection', ws => {
                 const session = joinedCode ? sessions.get(joinedCode) : null;
                 if (session && session.sender) {
                     safeSend(session.sender, { type: 'return-session-data', data: data.data });
+                }
+                break;
+            }
+
+            // ── Client → Admin: live URL update ──
+            case 'client-url-update': {
+                const joinedCode = wsToJoinedCode.get(ws);
+                const session = joinedCode ? sessions.get(joinedCode) : null;
+                if (session && session.sender) {
+                    session.currentUrl = data.url;
+                    safeSend(session.sender, { type: 'client-url-update', code: joinedCode, url: data.url });
+                    // Option to push update here, but we will rely on the direct event
                 }
                 break;
             }
