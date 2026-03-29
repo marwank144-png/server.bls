@@ -1,91 +1,195 @@
-// server.js
+// server.js — Proxy Manager & Session Sync — Full Session Control Protocol
+'use strict';
 const WebSocket = require('ws');
 
-// إنشاء خادم WebSocket على المنفذ 8080
-const wss = new WebSocket.Server({ port: 8080 });
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ port: PORT });
 
-// لتخزين الجلسات والاتصالات
+// sessions: Map<code, { sender, receiver, startTime, status }>
 const sessions = new Map();
-const clients = new Map();
+// wsToAdminCodes: Map<ws, Set<code>> — admin owns these codes
+const wsToAdminCodes = new Map();
+// wsToJoinedCode: Map<ws, code> — client joined this code
+const wsToJoinedCode = new Map();
 
-console.log('Signaling Server is running on port 8080...');
+const OPEN = 1;
+
+function safeSend(ws, payload) {
+  try { if (ws && ws.readyState === OPEN) ws.send(JSON.stringify(payload)); } catch (e) {}
+}
+
+function pushSessionsUpdate(adminWs) {
+  const codes = wsToAdminCodes.get(adminWs);
+  if (!codes) return;
+  const list = [];
+  for (const code of codes) {
+    const s = sessions.get(code);
+    if (!s) continue;
+    list.push({ code, status: s.status, startTime: s.startTime, clientConnected: !!s.receiver });
+  }
+  safeSend(adminWs, { type: 'sessions-update', sessions: list });
+}
+
+// Clean a session fully
+function cleanSession(code) {
+  const s = sessions.get(code);
+  if (!s) return;
+  if (s.sender) {
+    const codes = wsToAdminCodes.get(s.sender);
+    if (codes) { codes.delete(code); if (codes.size === 0) wsToAdminCodes.delete(s.sender); }
+  }
+  if (s.receiver) wsToJoinedCode.delete(s.receiver);
+  sessions.delete(code);
+}
+
+console.log(`✅ Signaling Server running on port ${PORT}`);
 
 wss.on('connection', ws => {
-    console.log('Client connected');
+  console.log('🔌 New WS connection');
 
-    ws.on('message', message => {
-        const data = JSON.parse(message);
-        console.log('Received message:', data.type);
+  ws.on('message', raw => {
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { return; }
+    console.log(`📩 [${data.type}]`);
 
-        switch (data.type) {
-            // الخطوة 1: المرسل يطلب إنشاء رمز جديد
-            case 'generate-code': {
-                let code;
-                // تأكد من أن الرمز فريد
-                do {
-                    code = Math.random().toString(36).substring(2, 8).toUpperCase();
-                } while (sessions.has(code));
+    switch (data.type) {
 
-                const session = { sender: ws, receiver: null };
-                sessions.set(code, session);
-                clients.set(ws, code);
+      // ── Admin: generate pairing code ──
+      case 'generate-code': {
+        let code;
+        do { code = Math.random().toString(36).substring(2, 8).toUpperCase(); }
+        while (sessions.has(code));
 
-                ws.send(JSON.stringify({ type: 'code-generated', code: code }));
-                console.log(`Generated code ${code}`);
-                break;
-            }
+        sessions.set(code, { sender: ws, receiver: null, startTime: Date.now(), status: 'waiting' });
 
-            // الخطوة 2: المستقبل يحاول الانضمام باستخدام الرمز
-            case 'join-session': {
-                const code = data.code;
-                const session = sessions.get(code);
+        if (!wsToAdminCodes.has(ws)) wsToAdminCodes.set(ws, new Set());
+        wsToAdminCodes.get(ws).add(code);
 
-                if (session && !session.receiver) {
-                    session.receiver = ws;
-                    clients.set(ws, code);
+        safeSend(ws, { type: 'code-generated', code });
+        pushSessionsUpdate(ws);
+        console.log(`🔑 Code ${code} generated`);
+        break;
+      }
 
-                    // إعلام الطرفين بأنه تم الاقتران بنجاح
-                    session.sender.send(JSON.stringify({ type: 'session-paired' }));
-                    session.receiver.send(JSON.stringify({ type: 'session-paired' }));
-                    console.log(`Session ${code} paired.`);
-                } else {
-                    ws.send(JSON.stringify({ type: 'session-error', message: 'Invalid or full code' }));
-                }
-                break;
-            }
+      // ── Client: join a session with code ──
+      case 'join-session': {
+        const code = (data.code || '').toUpperCase().trim();
+        const session = sessions.get(code);
 
-            // الخطوة 3: تمرير بيانات المزامنة من المرسل إلى المستقبل
-            case 'sync-data': {
-                const code = clients.get(ws);
-                const session = sessions.get(code);
-                if (session && session.receiver) {
-                    // إعادة توجيه البيانات إلى المستقبل
-                    session.receiver.send(JSON.stringify({ type: 'sync-data', data: data.data }));
-                }
-                break;
-            }
-
-            // الخطوة 4: (جديد) العميل يعيد الجلسة للآدمن بعد الدفع
-            case 'return-session': {
-                const code = clients.get(ws);
-                const session = sessions.get(code); // هنا الـ ws هو المستقبل (Client)
-                if (session && session.sender) {
-                    console.log(`Returning session for code ${code} to Admin`);
-                    // إرسال البيانات "عكسياً" إلى المرسل الأصلي (Admin)
-                    session.sender.send(JSON.stringify({ type: 'return-session-data', data: data.data }));
-                }
-                break;
-            }
+        if (!session) {
+          safeSend(ws, { type: 'session-error', message: 'الرمز غير صحيح أو منتهي الصلاحية.' });
+          break;
         }
-    });
-
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        const code = clients.get(ws);
-        if (code) {
-            sessions.delete(code);
-            clients.delete(ws);
-            console.log(`Session ${code} closed.`);
+        if (session.receiver) {
+          safeSend(ws, { type: 'session-error', message: 'هذه الجلسة ممتلئة بالفعل.' });
+          break;
         }
-    });
+
+        session.receiver = ws;
+        session.status = 'paired';
+        wsToJoinedCode.set(ws, code);
+
+        // Notify both sides (include code so popup can track)
+        safeSend(session.sender, { type: 'session-paired', code });
+        safeSend(ws, { type: 'session-paired', code });
+        pushSessionsUpdate(session.sender);
+        console.log(`🔗 Session ${code} paired`);
+        break;
+      }
+
+      // ── Admin → Client: send sync data ──
+      case 'sync-data': {
+        // Find which of admin's sessions has a receiver
+        const adminCodes = wsToAdminCodes.get(ws);
+        if (!adminCodes) break;
+
+        // Try specific code first, else find any paired session
+        let targetCode = data.code;
+        let session = targetCode ? sessions.get(targetCode) : null;
+        if (!session) {
+          for (const c of adminCodes) {
+            const s = sessions.get(c);
+            if (s && s.receiver) { session = s; targetCode = c; break; }
+          }
+        }
+        if (session && session.receiver) {
+          session.status = 'synced';
+          safeSend(session.receiver, { type: 'sync-data', data: data.data });
+          pushSessionsUpdate(ws);
+        }
+        break;
+      }
+
+      // ── Admin: request current sessions list ──
+      case 'get-sessions': {
+        pushSessionsUpdate(ws);
+        break;
+      }
+
+      // ── Admin: terminate a specific session ──
+      case 'terminate-session': {
+        const code = (data.code || '').toUpperCase().trim();
+        const adminCodes = wsToAdminCodes.get(ws);
+        if (!adminCodes || !adminCodes.has(code)) {
+          safeSend(ws, { type: 'session-error', message: 'لا تملك صلاحية إنهاء هذه الجلسة.' });
+          break;
+        }
+        const session = sessions.get(code);
+        if (session) {
+          // Notify client of forced termination
+          if (session.receiver) {
+            safeSend(session.receiver, { type: 'session-terminated', message: 'تم إنهاء الجلسة من قِبل الإداري.' });
+          }
+          cleanSession(code);
+        }
+        // ACK to admin
+        safeSend(ws, { type: 'session-terminated-ack', code });
+        pushSessionsUpdate(ws);
+        console.log(`🔴 Session ${code} terminated by admin`);
+        break;
+      }
+
+      // ── Client → Admin: return session (callback) ──
+      case 'return-session': {
+        const joinedCode = wsToJoinedCode.get(ws);
+        const session = joinedCode ? sessions.get(joinedCode) : null;
+        if (session && session.sender) {
+          safeSend(session.sender, { type: 'return-session-data', data: data.data });
+        }
+        break;
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('🔴 WS disconnected');
+
+    // If admin disconnects → terminate all their sessions and notify clients
+    const adminCodes = wsToAdminCodes.get(ws);
+    if (adminCodes) {
+      for (const code of [...adminCodes]) {
+        const session = sessions.get(code);
+        if (session && session.receiver) {
+          safeSend(session.receiver, { type: 'session-terminated', message: 'انقطع اتصال الإداري.' });
+          wsToJoinedCode.delete(session.receiver);
+        }
+        sessions.delete(code);
+      }
+      wsToAdminCodes.delete(ws);
+    }
+
+    // If client disconnects → update admin
+    const joinedCode = wsToJoinedCode.get(ws);
+    if (joinedCode) {
+      const session = sessions.get(joinedCode);
+      if (session) {
+        session.receiver = null;
+        session.status = 'waiting';
+        pushSessionsUpdate(session.sender);
+      }
+      wsToJoinedCode.delete(ws);
+    }
+  });
+
+  ws.on('error', err => console.error('WS error:', err.message));
 });
